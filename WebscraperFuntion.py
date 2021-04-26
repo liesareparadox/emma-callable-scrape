@@ -1,21 +1,17 @@
-import glob
-import re
-import time
-import urllib
 from time import sleep
 
-import PyPDF2
-import numpy as np
-import pandas as pd
-from bs4 import BeautifulSoup
-from pikepdf import Pdf
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support import expected_conditions as ec
-from selenium.webdriver.support.ui import Select
-from selenium.webdriver.support.ui import WebDriverWait
+import PIL.Image
 
 import LogModule
+import pandas as pd
+import pytesseract as pt
+import requests
+import csv
+from PIL import Image, ImageFilter
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import Select
+from selenium.common import exceptions
 
 # Set to True to Enable Logging for testing and maintenance
 write_logs = True
@@ -26,6 +22,9 @@ if write_logs:
 
 # set to true to disable browser gui
 headless = False
+
+chromedriver_file_location = '/Users/oblivion/PycharmProjects/muuni/bin/chromedriver'
+emma_site_url = 'https://emma.msrb.org/TradeData/Search'
 
 
 def headless_browser():
@@ -39,10 +38,9 @@ def headless_browser():
 
 class ChromeWebDriver:
     def __init__(self):
-        self.chromedriver_file = '/Users/oblivion/PycharmProjects/muuni/bin/chromedriver'
+        self.chromedriver_file = chromedriver_file_location
         self.driver = webdriver.Chrome(executable_path=self.chromedriver_file, options=headless_browser())
-        self.site_address = 'https://emma.msrb.org/Search/Search.aspx'
-        self.state_list = []
+        self.site_address = emma_site_url
 
     def go_to_emma_and_accept_disclaimer(self):
         logger.info(f'Opening page "{self.site_address}"')
@@ -52,163 +50,138 @@ class ChromeWebDriver:
         sleep(2)
 
     def specify_callable_yes(self):
-        """
-        accepts a list of purposes
-        """
-        select = Select(self.driver.find_element_by_id('callableDropDownList'))
+        select = Select(self.driver.find_element_by_id('callableOptionsList'))
         select.select_by_value("Y")
 
+    def specify_tax_exempt(self):
+        select = Select(self.driver.find_element_by_id('taxableOptionsList'))
+        select.select_by_value("N")
+
+    def set_trade_yields(self, minimum, maximum):
+        """
+        self, minimum value, maximum value)
+        must be integer
+        """
+        self.driver.find_element_by_xpath('//*[@id="tradeYieldFrom"]').send_keys(f'{minimum}')
+        self.driver.find_element_by_xpath('//*[@id="tradeYieldTo"]').send_keys(f'{maximum}')
+        sleep(.2)
+
+    def click_on_state_dropdown(self):
+        self.driver.find_element_by_xpath('//*[@id="searchCriteria"]/ul[2]/li[2]/button').click()
+        sleep(.2)
+
     def get_state_list(self):
-        states_dropdown = self.driver.find_element_by_id("stateDropdownList")
-        selector = Select(states_dropdown)
+        """
+        Creates a dictionary of available state values and their index
+        :return: dictionary of state: index value pairs
+        """
+        state_list = {}
+        self.click_on_state_dropdown()
 
-        element = WebDriverWait(self.driver, 10).until(ec.element_to_be_selected(selector.options[0]))
+        for index in range(0, 57):
+            state = self.driver.find_element_by_xpath(f'//*[@id="ui-multiselect-state-option-{index}"]').get_attribute(
+                'title')
+            state_list.update({state: index})
+        return state_list
 
-        all_states = selector.options
-        for states in range(1, len(all_states)):
-            self.state_list.append(all_states[states].text)
-
-    def specify_state(self, state):
-        self.driver.find_element_by_xpath('//*[@id="stateDropdownList"]').click()
-        # select = Select(self.driver.find_element_by_id('stateDropdownList'))
-        # select.select_by_value(state)
+    def click_on_state(self, state_index):
+        """
+        This will check and uncheck options in the state dropdown
+        :param state_index: 0 - 57
+        :return: a check on the specified state index
+        """
+        self.driver.find_element_by_xpath(f'//*[@id="ui-multiselect-state-option-{state_index}"]').click()
+        sleep(.2)
 
     def specify_search_date(self, start, end):
         """
         Dates must be in mm/dd/yyyy format
         """
-        self.driver.find_element_by_xpath('//*[@id="datedDateFrom"]').send_keys(f'{start}')
-        self.driver.find_element_by_xpath('//*[@id="datedDateTo"]').send_keys(f'{end}')
+        self.driver.find_element_by_xpath('//*[@id="tradeDateFrom"]').send_keys(f'{start}')
+        self.driver.find_element_by_xpath('//*[@id="tradeDateTo"]').send_keys(f'{end}')
+        sleep(.2)
 
     def run_search(self):
-        self.driver.find_element_by_xpath('//*[@id="runSearchButton"]').click()
+        self.driver.find_element_by_id('searchButton').click()
+        sleep(3)
 
-    def change_view_to_be_by_issuers(self):
-        self.driver.find_element_by_xpath('//*[@id="issuesTab"]').click()
+    def click_display_results_by_100(self):
+        """
+        selects 100 in the display results dropdown
+        """
+        display = self.driver.find_element_by_name('lvSearchResults_length')
+        Select(display).select_by_value('100')
 
-    def select_purpose_of_muni_bond(self, purpose_of_muni_bond):
-        select = Select(self.driver.find_element_by_name('lvIssues_length'))
-        select.select_by_visible_text(purpose_of_muni_bond)
-        self.driver.find_element_by_xpath('/html/body/form/div[10]/div/div/div[2]/button').click()
 
-
-# now that we have the page the way we want it to look, we can look through all the pages for bond names issuer names
-# and links
-class DataScraper(ChromeWebDriver):
-    def __init__(self):
-        super().__init__()
+class DataScraper:
+    def __init__(self, driver):
+        self.driver = driver
         self.max_n = None
         self.page_search_iterations = None
         self.doc_table = None
+        self.translated_image = None
 
-    def setup_data_scraper(self):
-        self.max_n = int(self.driver.find_element_by_id('lvIssues_info').text.split(' ')[5].replace(',', ''))
-        self.page_search_iterations = int(np.ceil(self.max_n / 100))
+    def __get_number_of_iterations_for_this_search(self):
+        try:
+            self.page_search_iterations = int(
+                self.driver.find_element_by_xpath('//*[@id="lvSearchResults_paginate"]/span/a[6]'
+                                                  ).get_attribute('text'))
+        except exceptions.NoSuchElementException:
+            self.page_search_iterations = 1
+        logger.info(f'Number of pages in search: {self.page_search_iterations}')
 
-    def __create_document_table(self):
-        self.doc_table = pd.DataFrame(columns=['Issuer Name', 'Description', 'State', 'Dated Date', 'link'])
+    def create_document_table(self):
+        self.doc_table = pd.DataFrame(columns=['Trade Date/Time',
+                                               'CUSIP *',
+                                               'Security Description *',
+                                               'Coupon(%)',
+                                               'MaturityDate',
+                                               'Price (%)',
+                                               'Yield (%)',
+                                               'Calculation Date & Price (%)',
+                                               'TradeAmount($)',
+                                               'Trade Type',
+                                               'SpecialCondition'
+                                               ])
 
-        # num of pages to go through.
+    def __capture_cusips_image(self, index):
+        self.image = self.driver.find_element_by_xpath(f'//*[@id="lvSearchResults"]/tbody/tr[{index}]/td[2]/ul/li[1]/a')
+        image_source = self.image.getAttribute("src")
+        url = self.image.current_url()
 
-    def __iterate_through_pages(self):
-        for pages in range(0, self.page_search_iterations):
+        image = Image.new()
+
+    def __translate_cusips_from_image(self):
+        self.translated_cusips = pt.image_to_string(self.image)
+
+    def add_cusips_to_table(self, table, iterations):
+        for cusips in range(1, iterations):
+            self.__capture_cusips_image(cusips)
+            self.__translate_cusips_from_image()
+            table.update(['CUSIP *'][cusips], self.translated_image)
+
+    def copy_data_and_iterate_through_pages(self):
+
+        self.__get_number_of_iterations_for_this_search()
+
+        for pages in range(1, self.page_search_iterations + 1):
             html = self.driver.page_source
-            table = pd.read_html(html)[4]
-            soup = BeautifulSoup(html, 'html.parser')
+            table = pd.read_html(html)[0]
+            # cusips_iteration_end_point = len(table)
+            # self.add_cusips_to_table(table, cusips_iteration_end_point)
+            self.doc_table = self.doc_table.append(table, ignore_index=True, sort=False)
+            sleep(1)
 
-            # look for the link to bond issue page.
-            table['link'] = [item.get('href') for item in soup.find_all("a", href=re.compile("IssueView"))]
-
-            self.doc_table.append(table, ignore_index=True)
-            time.sleep(5)
+            if pages != self.page_search_iterations:
+                self.__continue_to_next_page()
 
     def __continue_to_next_page(self):
         # click to next page and run through the loop again.
-        self.driver.find_element_by_xpath(
-            '/html/body/form/div[9]/div[3]/div[2]/div[2]/div[6]/div[3]/div/div/div[5]/a[3]').click()
+        self.driver.find_element_by_id('lvSearchResults_next').click()
+        sleep(2)
 
-    def __create_bond_id(self):
-        self.doc_table['ID'] = [link.split('/')[-1] for link in self.doc_table['link']]
-
-    def go_through_list_of_links_and_download_the_pdfs(self):
-        for i in range(6, len(self.doc_table)):
-            link = self.doc_table['link'][i]
-            name = self.doc_table['ID'][i]
-            url = link.replace('..', 'https://emma.msrb.org')
-
-            try:
-                self.driver.get(url)
-                time.sleep(2)
-                self.driver.find_element_by_xpath('//*[@id="ui-id-4"]').click()
-                html = self.driver.page_source
-                soup = BeautifulSoup(html, 'html.parser')
-
-                pdf_link = [item.get('href') for item in soup.find_all("a", href=re.compile(".pdf"))][0]
-                urllib.request.urlretrieve('https://emma.msrb.org' + pdf_link, f'{name}.pdf')
-
-                time.sleep(5)
-            except Exception as e:
-                # print name if error occurs.
-                logger.warn(e)
-                print(name)
-
-
-def get_list_of_downloaded_pdfs():
-    txt_files = []
-    for file in glob.glob("*.pdf"):
-        txt_files.append(file.replace('\\', '/'))
-    return txt_files
-
-
-def decrypt_pdfs(txt_files):
-    for file in txt_files:
-        try:
-            new_pdf = Pdf.new()
-            with Pdf.open(file) as pdf:
-                pdf.save('E:/Users/atag3/Documents/Project_Data/Pull2/decrypted/' + file.split('/')[-1])
-        except Exception:
-            print(file)
-
-
-def create_list_decrypted_pdfs():
-    txt_files = []
-    for file in glob.glob("E:/Users/atag3/Documents/Project_Data/Pull2/decrypted/*.pdf"):
-        txt_files.append(file.replace('\\', '/'))
-
-
-def read_pdf_files(txt_files):
-    go_text = {}
-    for file in txt_files:
-        try:
-            # open allows you to read the file.
-            pdf_file_obj = open(file, 'rb')
-            # The pdfReader variable is a readable object that will be parsed.
-            pdf_reader = PyPDF2.PdfFileReader(pdf_file_obj)
-
-            # Discerning the number of pages will allow us to parse through all the pages.
-            num_pages = pdf_reader.numPages
-            count = 0
-            text = ""
-            # The while loop will read each page.
-            while count < num_pages:
-                page_obj = pdf_reader.getPage(count)
-                count += 1
-                text += page_obj.extractText()
-            # This if statement exists to check if the above library returned words. It's done because PyPDF2 cannot read
-            # scanned files.
-            if text != "":
-                text = text
-            # If the above returns as False, we run the OCR library textract to #convert scanned/image based PDF files
-            # into text.
-            else:
-                # this might be able to help with document scans but I was running into issues and it only helped with a
-                # few documents. text = textract.process(fileurl, method='tesseract', language='eng')
-                continue
-            # Now we have a text variable that contains all the text derived from
-
-            go_text[file] = {'doc': text}
-        except Exception:
-            print(file)
+    def write_csv_file(self):
+        self.doc_table.to_csv("emma_test.csv", index=False)
 
 
 if __name__ == '__main__':
